@@ -61,6 +61,7 @@ export interface AIOStreamsResponse<T> {
 
 export class AIOStreams {
   private userData: UserData;
+  private manifestUrl: string;
   private manifests: Record<string, Manifest | null>;
   private supportedResources: Record<string, StrictManifestResource[]>;
   private finalResources: StrictManifestResource[] = [];
@@ -85,6 +86,7 @@ export class AIOStreams {
   constructor(userData: UserData, skipFailedAddons: boolean = true) {
     this.addonInitialisationErrors = [];
     this.userData = userData;
+    this.manifestUrl = `${Env.BASE_URL}/stremio/${this.userData.uuid}/${this.userData.encryptedPassword}/manifest.json`;
     this.manifests = {};
     this.supportedResources = {};
     this.skipFailedAddons = skipFailedAddons;
@@ -371,64 +373,56 @@ export class AIOStreams {
       }
     }
 
-    const rpdb =
+    const rpdbApiKey =
       modification?.rpdb && this.userData.rpdbApiKey
-        ? new RPDB(this.userData.rpdbApiKey)
+        ? this.userData.rpdbApiKey
         : undefined;
-    const ourManifestUrl = `${Env.BASE_URL}/stremio/${this.userData.uuid}/${this.userData.encryptedPassword}/manifest.json`;
+    const rpdbApi = rpdbApiKey ? new RPDB(rpdbApiKey) : undefined;
 
-    catalog = catalog.map((item) => {
-      // Apply RPDB poster modification
-      if (rpdb) {
-        const posterUrl = rpdb.getPosterUrl(
-          type,
-          (item as any).imdb_id || item.id
-        );
-        if (posterUrl) item.poster = posterUrl;
-      }
-
-      // Apply poster enhancement
-      if (this.userData.enhancePosters && Math.random() < 0.2) {
-        item.poster = Buffer.from(
-          constants.DEFAULT_POSTERS[
-            Math.floor(Math.random() * constants.DEFAULT_POSTERS.length)
-          ],
-          'base64'
-        ).toString('utf-8');
-      }
-
-      if (item.links) {
-        item.links = item.links.map((link) => {
-          try {
-            if (link.url.startsWith('stremio:///discover/')) {
-              const linkUrl = new URL(
-                decodeURIComponent(link.url.split('/')[4])
-              );
-              // see if the linked addon is one of our addons and replace the transport url with our manifest url if so
-              const addon = this.addons.find(
-                (a) => new URL(a.manifestUrl).hostname === linkUrl.hostname
-              );
-              if (addon) {
-                const [_, linkType, catalogIdAndQuery] = link.url
-                  .replace('stremio:///discover/', '')
-                  .split('/');
-                const newCatalogId = `${addon.instanceId}.${catalogIdAndQuery}`;
-                const newTransportUrl = encodeURIComponent(ourManifestUrl);
-                link.url = `stremio:///discover/${newTransportUrl}/${linkType}/${newCatalogId}`;
-              }
+    catalog = await Promise.all(
+      catalog.map(async (item) => {
+        // Apply RPDB poster modification
+        if (rpdbApiKey && item.poster) {
+          let posterUrl = item.poster;
+          if (this.userData.rpdbUseRedirectApi !== false && Env.BASE_URL) {
+            const id = (item as any).imdb_id || item.id;
+            const url = new URL(Env.BASE_URL);
+            url.pathname = '/api/v1/rpdb';
+            url.searchParams.set('id', id);
+            url.searchParams.set('type', type);
+            url.searchParams.set('fallback', item.poster);
+            url.searchParams.set('apiKey', rpdbApiKey);
+            posterUrl = url.toString();
+          } else {
+            const rpdbPosterUrl = await rpdbApi!.getPosterUrl(
+              type,
+              (item as any).imdb_id || item.id,
+              false
+            );
+            if (rpdbPosterUrl) {
+              posterUrl = rpdbPosterUrl;
             }
-          } catch (error) {
-            logger.error(`Error converting discover deep link`, {
-              error: error instanceof Error ? error.message : String(error),
-              link: link.url,
-            });
-            // Ignore errors, leave link as is
           }
-          return link;
-        });
-      }
-      return item;
-    });
+
+          item.poster = posterUrl;
+        }
+
+        // Apply poster enhancement
+        if (this.userData.enhancePosters && Math.random() < 0.2) {
+          item.poster = Buffer.from(
+            constants.DEFAULT_POSTERS[
+              Math.floor(Math.random() * constants.DEFAULT_POSTERS.length)
+            ],
+            'base64'
+          ).toString('utf-8');
+        }
+
+        if (item.links) {
+          item.links = this.convertDiscoverDeepLinks(item.links);
+        }
+        return item;
+      })
+    );
 
     return { success: true, data: catalog, errors: [] };
   }
@@ -524,6 +518,7 @@ export class AIOStreams {
           addonName: candidate.addon.name,
           addonInstanceId: candidate.instanceId,
         });
+        meta.links = this.convertDiscoverDeepLinks(meta.links);
 
         return {
           success: true,
@@ -1124,6 +1119,32 @@ export class AIOStreams {
       });
     }
     return streams;
+  }
+
+  private convertDiscoverDeepLinks(items: Meta['links']) {
+    if (!items) {
+      return items;
+    }
+    return items.map((link) => {
+      try {
+        if (link.url.startsWith('stremio:///discover/')) {
+          const linkUrl = new URL(decodeURIComponent(link.url.split('/')[4]));
+          // see if the linked addon is one of our addons and replace the transport url with our manifest url if so
+          const addon = this.addons.find(
+            (a) => new URL(a.manifestUrl).hostname === linkUrl.hostname
+          );
+          if (addon) {
+            const [_, linkType, catalogIdAndQuery] = link.url
+              .replace('stremio:///discover/', '')
+              .split('/');
+            const newCatalogId = `${addon.instanceId}.${catalogIdAndQuery}`;
+            const newTransportUrl = encodeURIComponent(this.manifestUrl);
+            link.url = `stremio:///discover/${newTransportUrl}/${linkType}/${newCatalogId}`;
+          }
+        }
+      } catch {}
+      return link;
+    });
   }
 
   private async precacheNextEpisode(type: string, id: string) {
